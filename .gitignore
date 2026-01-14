@@ -1,3 +1,8 @@
 .idea
-nvme-cli/nvme.c
+
 nvme-cli/kimkitae.code-workspace
+nvme-cli/tags
+
+.sh
+.out
+.in
