@@ -8919,6 +8919,75 @@ static int passthru(int argc, char **argv, bool admin,
 		}
 	}
 
+	if (cfg.opcode == 0xC0) {
+		char *filename = cfg.target_file;
+		printf("target_filename: %s\n", filename);
+
+		file_layout_t *layout = get_file_layout(filename);
+		if (!layout) {
+			fprintf(stderr, "Failed to get file layout\n");
+			return 1;
+		}
+		if (layout->extent_count == 0) {
+			fprintf(stderr, "No extent info\n");
+			free_file_layout(layout);
+			return -EINVAL;
+		}
+
+		/* 타깃에서 cmd->cdw10으로 extent_count를 받도록 약속 */
+		cfg.write   = true;                       /* 결과는 호스트로 안 받음 */
+		cfg.latency = 1;
+		cfg.cdw10  = (__u32)layout->extent_count; /* 타깃 파서가 쓰는 필드 */
+
+		/* 8KB in-capsule로 고정 (분할 없이 한 번에 보낼 목적) */
+		/* (nvme명령어 + data) + tcp pdu <= 8192 하므로 data 길이가 8192로 전송되면 안됨 */
+		const uint32_t MAX_INCAP = 4096;
+		cfg.data_len = MAX_INCAP;
+
+		/* 버퍼 준비 */
+		data = nvme_alloc_huge(cfg.data_len, &mh);
+		if (!data) {
+			free_file_layout(layout);
+			return -ENOMEM;
+		}
+		memset(data, 0, cfg.data_len);
+
+		/* extent 테이블 작성: [LBA, COUNT] × N */
+		uint64_t *u64 = (uint64_t *)data;
+		/* 실제로 보낼 data 바이트 수 계산 */
+		size_t need_bytes = (size_t)layout->extent_count * 2u * sizeof(uint64_t);
+
+		/* 4KB 초과 시 truncate (경고 출력) */
+		uint32_t max_extents_fit = (uint32_t)(cfg.data_len / (2u * sizeof(uint64_t)));
+		uint32_t send_extents = layout->extent_count;
+		if (need_bytes > cfg.data_len) {
+			fprintf(stderr,
+					"[WARN] extent table too large (%zuB > %uB). "
+					"truncating to first %u extents.\n",
+					need_bytes, cfg.data_len, max_extents_fit);
+			send_extents = max_extents_fit;
+			cfg.cdw10    = max_extents_fit;  /* 타깃에도 실제 전송 개수만 알리기 */
+			need_bytes   = (size_t)max_extents_fit * 2u * sizeof(uint64_t);
+		}
+
+		for (uint32_t i = 0; i < send_extents; i++) {
+			const extent_info_t *ext = &layout->extents[i];
+			u64[2*i + 0] = (uint64_t)ext->lba_start;
+			u64[2*i + 1] = (uint64_t)ext->lba_count;
+			printf("extent[%u] LBA=%llu, count=%llu\n",
+				i,
+				(unsigned long long)ext->lba_start,
+				(unsigned long long)ext->lba_count);
+		}
+
+		/* 디버깅: 실제 전송되는 메타만 덤프 */
+		dump_hex("Extent Table (Host, 0xC0)", data, need_bytes);
+
+		cfg.data_len = need_bytes;
+
+		free_file_layout(layout);
+		goto skip_data_fill;
+	}
 
 	if (cfg.opcode == 0xd1) {
                     char *filename = cfg.target_file;
@@ -9100,7 +9169,7 @@ static int passthru(int argc, char **argv, bool admin,
 					      mdata, nvme_cfg.timeout, &result);
 	else
 		err = nvme_io_passthru(dev_fd(dev), cfg.opcode, cfg.flags,
-				       cfg.rsvd,
+				       cfg.rsvd,	
 				       cfg.namespace_id, cfg.cdw2, cfg.cdw3,
 				       cfg.cdw10,
 				       cfg.cdw11, cfg.cdw12, cfg.cdw13,
@@ -9132,9 +9201,15 @@ static int passthru(int argc, char **argv, bool admin,
 			     d_raw((unsigned char *)data, cfg.data_len); // raw binary 그대로 출력
 			     printf("\n");
 			}
+
+			if (cfg.opcode == 0xC0) {
+				fwrite(data, 1, cfg.data_len, stdout);   // ASCII 그대로 출력
+				// dump_hex("Custom result", data, cfg.data_len); // 16진 덤프가 필요하면 이렇게
+        	}
+
 		if (cfg.read)	passthru_print_read_output(cfg, data, dfd, mdata, mfd, err);
-	
-	}
+			
+	} 
 	return err;
 }
 
