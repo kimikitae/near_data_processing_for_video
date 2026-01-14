@@ -5,3 +5,5 @@ nvme-cli/tags
 
 .out
 .in
+spdk/cscope.po.out
+spdk/cscope.in.out
