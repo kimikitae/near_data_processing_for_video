@@ -396,6 +396,8 @@ int nvmf_bdev_ctrlr_custom_grep_cmd(struct spdk_bdev *bdev, struct spdk_bdev_des
                                 struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
                                 struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
+int nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
+                                struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int nvmf_bdev_ctrlr_compare_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 				struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int nvmf_bdev_ctrlr_compare_and_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,

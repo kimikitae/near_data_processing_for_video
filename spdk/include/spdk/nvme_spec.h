@@ -1742,6 +1742,8 @@ enum spdk_nvme_nvm_opcode {
 	SPDK_NVME_OPC_COPY				= 0x19,
 	SPDK_NVME_OPC_IO_MANAGEMENT_SEND		= 0x1D,
 
+	SPDK_NVME_OPC_CUSTOM_PREPROCESS = 0xc0, // opcode for preprocessing of YOLO?
+
 	SPDK_NVME_OPC_CUSTOM_ECHO = 0xd0, // opcode for custom echo,
 	SPDK_NVME_OPC_CUSTOM_GREP = 0xd1, // opcode for custom grep,
 	SPDK_NVME_OPC_CUSTOM_HEAAN_ADD = 0xe0,   // opcode for HEaaN addition

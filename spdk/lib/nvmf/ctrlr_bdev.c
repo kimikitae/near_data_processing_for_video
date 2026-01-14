@@ -13,12 +13,14 @@
 #include "spdk/thread.h"
 #include "spdk/likely.h"
 #include "spdk/nvme.h"
+#include "spdk/nvme_spec.h"
 #include "spdk/nvmf_cmd.h"
 #include "spdk/nvmf_spec.h"
 #include "spdk/trace.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
+#include "spdk/env.h"
 
 #include "spdk/log.h"
 
@@ -27,7 +29,6 @@ struct custom_grep_ctx {
     char *buffer;
     size_t buffer_len;
 };
-
 
 static void nvmf_print_iov(const struct spdk_nvmf_request *req, uint32_t data_len)
 {
@@ -1110,20 +1111,20 @@ nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev
 	uint64_t* u64data = (uint64_t *)data_buf_ptr;
 	uint32_t buf_num = 0;
 	for(int i = 0; i < input_0_extents_count; i++) {
-    	fprintf(stdout, "IN 0 LBA: %lld\n", u64data[2*buf_num]);
-    	fprintf(stdout, "IN 0 Len: %lld\n", u64data[2*buf_num+1]);
+    	fprintf(stdout, "IN 0 LBA: %lu\n", u64data[2*buf_num]);
+    	fprintf(stdout, "IN 0 Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
 	}
 	
 	for(int i = 0; i < input_1_extents_count; i++) {
-    	fprintf(stdout, "IN 1 LBA: %lld\n", u64data[2*buf_num]);
-    	fprintf(stdout, "IN 1 Len: %lld\n", u64data[2*buf_num+1]);
+    	fprintf(stdout, "IN 1 LBA: %lu\n", u64data[2*buf_num]);
+    	fprintf(stdout, "IN 1 Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
 	}
 	
 	for(int i = 0; i < target_extents_count; i++) {
-    	fprintf(stdout, "TGT LBA: %lld\n", u64data[2*buf_num]);
-    	fprintf(stdout, "TGT Len: %lld\n", u64data[2*buf_num+1]);
+    	fprintf(stdout, "TGT LBA: %lu\n", u64data[2*buf_num]);
+    	fprintf(stdout, "TGT Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
 	}
 
@@ -1132,6 +1133,191 @@ nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev
     //return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
     return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
+
+struct ndp_request_ctx {
+	uint64_t read_start_lba, read_num_blocks;
+    struct spdk_nvmf_request *req;
+    void *read_buf;
+};
+
+/* * I/O 완료 콜백 함수 */
+static void
+ndp_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+    struct ndp_request_ctx *ctx = (struct ndp_request_ctx *)cb_arg;
+    struct spdk_nvmf_request *req = ctx->req;
+    struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+
+    if (success) {
+        SPDK_NOTICELOG("[CUST] Read Complete! :\n");
+		SPDK_NOTICELOG("read lba: %lu read blocks: %lu \n", ctx->read_start_lba, ctx->read_num_blocks);
+
+		// 읽어온 데이터 출력
+        spdk_log_dump(stdout, "Read_DATA", ctx->read_buf, ctx->read_num_blocks * 512);
+
+		
+		/*
+			여기에 연산 해야함
+			video?
+			h264는 파일로 접근해야하나?
+			extent 늘어날거 생각해서 ctx에 nvme 통해서 들어온 정보들 유지하기
+
+		
+		*/
+
+    	rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+        rsp->status.sc = SPDK_NVME_SC_SUCCESS;
+    } else {
+        SPDK_ERRLOG("[CUST] Read failed in read callback function \n");
+        rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+        rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+    }
+
+    spdk_bdev_free_io(bdev_io);
+
+    spdk_free(ctx->read_buf);
+    spdk_free(ctx);
+
+    spdk_nvmf_request_complete(req);
+}
+
+int
+nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
+                                      struct spdk_bdev_desc *desc,
+                                      struct spdk_io_channel *ch,
+                                      struct spdk_nvmf_request *req)
+{
+
+    struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+
+	uint64_t bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
+	uint32_t block_size = spdk_bdev_get_block_size(bdev);
+
+	uint32_t extents_count = cmd->cdw10;
+	uint64_t lba[extents_count], blocks[extents_count];
+
+	SPDK_NOTICELOG("bdev_num_blocks : %lu block_size : %u \n", bdev_num_blocks, block_size);
+    SPDK_NOTICELOG("[CUST] Entered custom preprocess (OPC=0x%02x)\n", cmd->opc);
+
+    if (!req->iov || req->iovcnt <= 0) {
+        SPDK_ERRLOG("[CUST] No IOV payload\n");
+        return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+    }
+
+	void *buf = req->iov[0].iov_base;
+
+	// 각 extent에 대해서 LBA와 블록 수 파싱 및 I/O
+	for (uint32_t i = 0; i < extents_count; i++) {
+		memcpy(&lba[i],    buf + 2 * i * 8,  8);
+		memcpy(&blocks[i], buf + 2 * i * 8 + 8,  8);
+
+		SPDK_NOTICELOG("[CUST] extent[0]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n", 8 * lba[i], 8 * blocks[i]);
+
+		/* 버퍼 할당 */
+		void *read_buf = spdk_dma_zmalloc(8 * block_size * blocks[i], 0, NULL);
+
+		if (!read_buf) {
+			SPDK_ERRLOG("Memory allocation failed\n");
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE; 
+		}
+
+		/* Context 할당 및 설정 */
+		struct ndp_request_ctx *ctx = spdk_zmalloc(sizeof(struct ndp_request_ctx),0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (!ctx) {
+			SPDK_ERRLOG("Context allocation failed\n");
+			spdk_free(read_buf);
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		ctx->read_start_lba = 8 * lba[i];
+		ctx->read_num_blocks = 8 * blocks[i];
+		ctx->req = req;
+		ctx->read_buf = read_buf;
+
+		/* 비동기 읽기 요청 - ctx를 인자로 넘김 */
+		int rc = spdk_bdev_read_blocks(desc, ch,
+					ctx->read_buf, ctx->read_start_lba, ctx->read_num_blocks,
+					ndp_read_complete, ctx);
+
+		if (rc != 0) {
+			SPDK_ERRLOG("Read submission failed rc=%d\n", rc);
+			spdk_free(read_buf);
+			spdk_free(ctx);
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+	}
+
+    /* 비동기 처리 중이므로 ASYNCHRONOUS 리턴 */
+    return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
+}
+
+// int
+// nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
+//                                       struct spdk_bdev_desc *desc,
+//                                       struct spdk_io_channel *ch,
+//                                       struct spdk_nvmf_request *req)
+// {
+//     struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+//     struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+
+// 	/* check for coming command */
+//     SPDK_NOTICELOG("[CUST] Entered custom preprocess (OPC=0x%02x)\n", cmd->opc);
+
+//     /* 1) cdw10 host send = number of extents  */
+//     uint32_t extent_cnt = cmd->cdw10;
+//     SPDK_NOTICELOG("[CUST] extent_cnt = %u\n", extent_cnt);
+
+//     /* 2) check data */
+//     if (!req->iov || req->iovcnt <= 0) {
+//         SPDK_ERRLOG("[CUST][ERR] No IOV payload from host (iovcnt=%d)\n", req->iovcnt);
+//         rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+//         rsp->status.sc  = SPDK_NVME_SC_DATA_TRANSFER_ERROR;
+//         return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+//     }
+
+//     /* 3) parsing recieved extent table for lba and number of blocks from extent data */
+//     size_t meta_bytes = (size_t)extent_cnt * 2 * sizeof(uint64_t);
+//     uint8_t *buf = (uint8_t *)req->iov[0].iov_base;
+
+//     for (uint32_t i = 0; i < extent_cnt; i++) {
+//         uint64_t lba, blocks;
+//         memcpy(&lba,    buf + i * 16 + 0,  8);
+//         memcpy(&blocks, buf + i * 16 + 8,  8);
+//         SPDK_NOTICELOG("[CUST] extent[%u]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n",
+//                        i, lba, blocks);
+
+// 		/* get(read) target file */
+// 		void* read_buf = spdk_malloc(4096 * blocks, 0x1000, NULL,
+// 							SPDK_ENV_SOCKET_ID_ANY,
+// 							SPDK_MALLOC_DMA);
+
+// 		int rc = spdk_bdev_read_blocks(desc, ch,
+// 					read_buf, lba, blocks,
+// 					nvmf_bdev_ctrlr_complete_cmd, req);
+
+// 		SPDK_NOTICELOG("print read_buf : \n%s\n", (char*)read_buf);
+//     }
+
+// 	/* get(read) target file */
+// 	// void* read_buf = spdk_malloc(4096 * blocks, 0x1000, NULL,
+// 	// 					SPDK_ENV_SOCKET_ID_ANY,
+//     //                     SPDK_MALLOC_DMA);
+
+// 	// int rc = spdk_bdev_read_blocks(desc, ch,
+// 	// 			read_buf, lba, blocks,
+// 	// 			nvmf_bdev_ctrlr_complete_cmd, req);
+
+// 	// SPDK_NOTICELOG("print read_buf : \n%s\n", (char*)read_buf);
+
+//     /* final) set response of complete status */
+//     rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+//     rsp->status.sc  = SPDK_NVME_SC_SUCCESS;
+//     SPDK_NOTICELOG("[CUST] Completed parsing, returning SUCCESS.\n");
+
+//     return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+// }
+
+
 
 int
 nvmf_bdev_ctrlr_compare_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,

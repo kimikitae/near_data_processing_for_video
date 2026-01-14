@@ -667,6 +667,11 @@ spdk_nvmf_req_get_xfer(struct spdk_nvmf_request *req) {
 //    fprintf(stdout, "hello, this is spdk_nvmf_req_get_xfer\n");
 //    fprintf(stdout, "xfer: %d\n", xfer);
 
+	if (cmd->opc == 0xC0) { // preprocess command
+        return SPDK_NVME_DATA_HOST_TO_CONTROLLER;
+        //return SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+    }	
+
     if (cmd->opc == 0xD0) {  // 커스텀 Echo 명령 //데이터 양방향 전송
         return SPDK_NVME_DATA_CONTROLLER_TO_HOST;
     }
@@ -675,7 +680,7 @@ spdk_nvmf_req_get_xfer(struct spdk_nvmf_request *req) {
         return SPDK_NVME_DATA_HOST_TO_CONTROLLER;
         //return SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 	}
-
+	
 	/* Figure out data transfer direction */
 	if (cmd->opc == SPDK_NVME_OPC_FABRIC)
 	{
