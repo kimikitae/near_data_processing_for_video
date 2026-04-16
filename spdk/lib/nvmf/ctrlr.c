@@ -2543,6 +2543,8 @@ static const struct spdk_nvme_cmds_and_effect_log_page g_cmds_and_effect_log_pag
     [SPDK_NVME_OPC_CUSTOM_HEAAN_BTSRP]     = {1, 1, 0, 0, 0, 0, 0, 0},
 	/* YOLO PREPROCESS */
 	[SPDK_NVME_OPC_CUSTOM_PREPROCESS]	 = {1, 1, 0, 0, 0, 0, 0, 0},
+	/* YOLO GET RESULT */
+	[SPDK_NVME_OPC_CUSTOM_GET_RESULT]	 = {1, 0, 0, 0, 0, 0, 0, 0},
 	},
 };
 
@@ -4461,6 +4463,8 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 			return nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(bdev, desc, ch, req);
 		case SPDK_NVME_OPC_CUSTOM_PREPROCESS:
 			return nvmf_bdev_ctrlr_custom_preprocess_cmd(bdev, desc, ch, req);
+		case SPDK_NVME_OPC_CUSTOM_GET_RESULT:
+			return nvmf_bdev_ctrlr_custom_get_result_cmd(bdev, desc, ch, req);
 		// END OF CUSTOM COMMAND
 		case SPDK_NVME_OPC_COMPARE:
 			if (spdk_unlikely(!ctrlr->cdata.oncs.compare)) {

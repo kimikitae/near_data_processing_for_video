@@ -21,6 +21,7 @@ endif
 APP := $(APP)$(EXEEXT)
 
 LIBS += $(SPDK_LIB_LINKER_ARGS)
+LIBS += -lavcodec -lavutil -lavformat -lswscale
 
 CLEAN_FILES = $(APP)
 

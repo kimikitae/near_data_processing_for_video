@@ -11,6 +11,8 @@ APP = nvmf_tgt
 
 C_SRCS := nvmf_main.c
 
+SYS_LIBS += -lavcodec -lavutil -lavformat
+
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_nvmf
 
 ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))

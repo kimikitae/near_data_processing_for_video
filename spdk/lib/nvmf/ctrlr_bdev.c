@@ -24,37 +24,46 @@
 
 #include "spdk/log.h"
 
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+
+
+
 struct custom_grep_ctx {
     struct spdk_nvmf_request *req;
     char *buffer;
     size_t buffer_len;
 };
 
-static void nvmf_print_iov(const struct spdk_nvmf_request *req, uint32_t data_len)
-{
-    if (req->iovcnt == 0) {
-        return;
-    }
+void dump_hex(const char *, const void *, size_t );
 
-    // Print first iovec info
-    fprintf(stdout, "First iovec base: %p, len: %zu\n", req->iov[0].iov_base, req->iov[0].iov_len);
+// static void nvmf_print_iov(const struct spdk_nvmf_request *req, uint32_t data_len)
+// {
+//     if (req->iovcnt == 0) {
+//         return;
+//     }
 
-    // Print data content
-    fprintf(stdout, "Data content: ");
-    uint32_t total_copied = 0;
+//     // Print first iovec info
+//     fprintf(stdout, "First iovec base: %p, len: %zu\n", req->iov[0].iov_base, req->iov[0].iov_len);
 
-    for (int i = 0; i < req->iovcnt && total_copied < data_len; i++) {
-        char *data = (char *)req->iov[i].iov_base;
-        uint32_t iov_len = req->iov[i].iov_len;
-        uint32_t copy_len = spdk_min(data_len - total_copied, iov_len);
+//     // Print data content
+//     fprintf(stdout, "Data content: ");
+//     uint32_t total_copied = 0;
 
-        for (uint32_t j = 0; j < copy_len; j++) {
-            fprintf(stdout, "%c", data[j]);
-        }
-        total_copied += copy_len;
-    }
-    fprintf(stdout, "\n");
-}
+//     for (int i = 0; i < req->iovcnt && total_copied < data_len; i++) {
+//         char *data = (char *)req->iov[i].iov_base;
+//         uint32_t iov_len = req->iov[i].iov_len;
+//         uint32_t copy_len = spdk_min(data_len - total_copied, iov_len);
+
+//         for (uint32_t j = 0; j < copy_len; j++) {
+//             fprintf(stdout, "%c", data[j]);
+//         }
+//         total_copied += copy_len;
+//     }
+//     fprintf(stdout, "\n");
+// }
 
 static bool
 nvmf_subsystem_bdev_io_type_supported(struct spdk_nvmf_subsystem *subsystem,
@@ -474,11 +483,11 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	//nvmf_print_iov(req, req->length);
 
-	uint32_t meta_start_lba = cmd->cdw10; // 연산 메타데이터 파일의 LBA 시작 주소
-    uint32_t meta_block_count = cmd->cdw11; // 연산 메타데이터 파일의 블록 갯수
-    uint32_t target_start_lba = cmd->cdw12; // 연산 대상 파일의 LBA 시작 주소
-    uint32_t target_block_count = cmd->cdw13; // 연산 대상 파일의 블록 갯수
-    uint32_t target_block_cot = cmd->cdw14; // 연산 대상 파일의 블록 갯수
+	// uint32_t meta_start_lba = cmd->cdw10; // 연산 메타데이터 파일의 LBA 시작 주소
+    // uint32_t meta_block_count = cmd->cdw11; // 연산 메타데이터 파일의 블록 갯수
+    // uint32_t target_start_lba = cmd->cdw12; // 연산 대상 파일의 LBA 시작 주소
+    // uint32_t target_block_count = cmd->cdw13; // 연산 대상 파일의 블록 갯수
+    // uint32_t target_block_cot = cmd->cdw14; // 연산 대상 파일의 블록 갯수
 
 	/* printing logs for debugging */
 	/*
@@ -502,7 +511,7 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 //    }
 //    fprintf(stdout, "req->xfer: %u\n", req->xfer);
 
-    uint32_t tc = 0;
+//  uint32_t tc = 0;
 //
 //    if (req->iovcnt > 0) {
 //        fprintf(stdout, "First iovec base: %p, len: %zu\n", req->iov[0].iov_base, req->iov[0].iov_len);
@@ -718,7 +727,7 @@ nvmf_bdev_ctrlr_custom_grep_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *d
         .accel_sequence = req->accel_sequence,
     };
     uint64_t bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
-    uint32_t block_size = spdk_bdev_get_block_size(bdev);
+    // uint32_t block_size = spdk_bdev_get_block_size(bdev);
     struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
 
     // 유효성 검사
@@ -1110,19 +1119,19 @@ nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev
 	
 	uint64_t* u64data = (uint64_t *)data_buf_ptr;
 	uint32_t buf_num = 0;
-	for(int i = 0; i < input_0_extents_count; i++) {
+	for(uint32_t i = 0; i < input_0_extents_count; i++) {
     	fprintf(stdout, "IN 0 LBA: %lu\n", u64data[2*buf_num]);
     	fprintf(stdout, "IN 0 Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
 	}
 	
-	for(int i = 0; i < input_1_extents_count; i++) {
+	for(uint32_t i = 0; i < input_1_extents_count; i++) {
     	fprintf(stdout, "IN 1 LBA: %lu\n", u64data[2*buf_num]);
     	fprintf(stdout, "IN 1 Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
 	}
 	
-	for(int i = 0; i < target_extents_count; i++) {
+	for(uint32_t i = 0; i < target_extents_count; i++) {
     	fprintf(stdout, "TGT LBA: %lu\n", u64data[2*buf_num]);
     	fprintf(stdout, "TGT Len: %lu\n", u64data[2*buf_num+1]);
 		buf_num++;
@@ -1134,50 +1143,197 @@ nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev
     return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+// 0: IDLE, 1: DECODING/WRITING, 2: READY/READABLE
+volatile int g_ndp_state = 0;
+uint8_t *full_video_buffer = NULL;
+uint32_t g_total_frames = 0;
+uint16_t g_video_width = 0;
+uint16_t g_video_height = 0;
+
 struct ndp_request_ctx {
 	uint64_t read_start_lba, read_num_blocks;
     struct spdk_nvmf_request *req;
     void *read_buf;
 };
 
-/* * I/O 완료 콜백 함수 */
+struct buffer_data {
+    uint8_t *ptr;
+    size_t size;
+    uint8_t *start;
+    size_t total_size;
+};
+
+static int read_packet(void *opaque, uint8_t *buf, int buf_size) {
+    struct buffer_data *bd = (struct buffer_data *)opaque;
+    buf_size = (buf_size < (int)bd->size) ? buf_size : (int)bd->size;
+
+    if (buf_size <= 0) return AVERROR_EOF;
+
+    memcpy(buf, bd->ptr, buf_size);
+    bd->ptr += buf_size;
+    bd->size -= buf_size;
+    return buf_size;
+}
+
+static int64_t seek_packet(void *opaque, int64_t offset, int whence) {
+    struct buffer_data *bd = (struct buffer_data *)opaque;
+    uint8_t *next_ptr;
+
+    switch (whence) {
+        case SEEK_SET: next_ptr = bd->start + offset; break;
+        case SEEK_CUR: next_ptr = bd->ptr + offset; break;
+        case SEEK_END: next_ptr = bd->start + bd->total_size + offset; break;
+        case AVSEEK_SIZE: return bd->total_size;
+        default: return -1;
+    }
+
+    if (next_ptr < bd->start || next_ptr > bd->start + bd->total_size) return -1;
+
+    bd->ptr = next_ptr;
+    bd->size = bd->total_size - (bd->ptr - bd->start);
+    return (int64_t)(bd->ptr - bd->start);
+}
+
+
 static void
-ndp_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
     struct ndp_request_ctx *ctx = (struct ndp_request_ctx *)cb_arg;
     struct spdk_nvmf_request *req = ctx->req;
     struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
 
-    if (success) {
-        SPDK_NOTICELOG("[CUST] Read Complete! :\n");
-		SPDK_NOTICELOG("read lba: %lu read blocks: %lu \n", ctx->read_start_lba, ctx->read_num_blocks);
-
-		// 읽어온 데이터 출력
-        spdk_log_dump(stdout, "Read_DATA", ctx->read_buf, ctx->read_num_blocks * 512);
-
-		
-		/*
-			여기에 연산 해야함
-			video?
-			h264는 파일로 접근해야하나?
-			extent 늘어날거 생각해서 ctx에 nvme 통해서 들어온 정보들 유지하기
-
-		
-		*/
-
-    	rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-        rsp->status.sc = SPDK_NVME_SC_SUCCESS;
-    } else {
-        SPDK_ERRLOG("[CUST] Read failed in read callback function \n");
-        rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+    if (!success) {
+        SPDK_ERRLOG("[CUST] Read failed\n");
         rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+        goto cleanup;
     }
 
-    spdk_bdev_free_io(bdev_io);
+    if (g_ndp_state != 0) {
+        SPDK_ERRLOG("NDP Busy\n");
+        goto cleanup;
+    }
 
+    g_ndp_state = 1;
+
+    // init FFmpeg contexts
+    AVFormatContext *fmt_ctx = NULL;
+    AVCodecContext *codec_ctx = NULL;
+    AVIOContext *avio_ctx = NULL;
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    uint8_t *avio_ctx_buffer = NULL;
+    
+    int video_stream_idx = -1;
+    int frame_idx = 0;
+    int sampled_count = 0;
+    int current_frame_size = 0;
+
+    // 1. set up AVIOContext to read from memory buffer
+    struct buffer_data bd = {
+        .ptr = (uint8_t *)ctx->read_buf,
+        .start = (uint8_t *)ctx->read_buf,
+        .size = (size_t)(ctx->read_num_blocks * 512),
+        .total_size = (size_t)(ctx->read_num_blocks * 512)
+    };
+
+    avio_ctx_buffer = av_malloc(4096);
+    avio_ctx = avio_alloc_context(avio_ctx_buffer, 4096, 0, &bd, &read_packet, NULL, &seek_packet);
+    
+    fmt_ctx = avformat_alloc_context();
+    fmt_ctx->pb = avio_ctx;
+
+    if (avformat_open_input(&fmt_ctx, NULL, NULL, NULL) < 0) {
+        SPDK_ERRLOG("Failed to open MP4 from memory\n");
+        goto release;
+    }
+
+    avformat_find_stream_info(fmt_ctx, NULL);
+
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream_idx = i;
+            break;
+        }
+    }
+
+    if (video_stream_idx == -1) goto release;
+
+    // 3. set up codec context
+    const AVCodec *codec = avcodec_find_decoder(fmt_ctx->streams[video_stream_idx]->codecpar->codec_id);
+    codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[video_stream_idx]->codecpar);
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) goto release;
+
+    // get total number of frames (if available) to estimate buffer size for sampled frames
+    int64_t total_nb_frames = fmt_ctx->streams[video_stream_idx]->nb_frames;
+    if (total_nb_frames <= 0) total_nb_frames = 1000; // temporary fallback if frame count is not available
+
+    // (temporary) sample 1 out of every 10 frames, so we need buffer for at most total_nb_frames/10 frames
+    // int max_samples = (total_nb_frames / 10) + 1;
+	// 모든 프레임을 샘플링하기 위해 max_samples를 total_nb_frames로 설정
+	int max_samples = total_nb_frames;
+
+    // read frames and sample
+    while (av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index == video_stream_idx) {
+            if (avcodec_send_packet(codec_ctx, pkt) == 0) {
+                while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                    
+                    // sample every 10th frame
+                    //if (frame_idx % 10 == 0) {
+					// 모든 프레임을 샘플링하기 위해 조건문 제거
+					if (frame_idx % 1 == 0) {
+                        if (current_frame_size == 0) {
+                            current_frame_size = av_image_get_buffer_size(frame->format, frame->width, frame->height, 1);
+							g_video_width = frame->width;
+							g_video_height = frame->height;
+                        }
+
+                        if (full_video_buffer == NULL) {
+                            // alloc buffer for sampled frames (assuming max_samples frames, each of size current_frame_size)
+                            full_video_buffer = spdk_dma_zmalloc(current_frame_size * max_samples, 4096, NULL);
+                        }
+
+                        if (full_video_buffer) {
+                            // dst buffer for the current sampled frame is at offset (sampled_count * current_frame_size) in full_video_buffer
+                            uint8_t *dst_ptr = (uint8_t *)full_video_buffer + (sampled_count * current_frame_size);
+                            
+                            av_image_copy_to_buffer(dst_ptr, current_frame_size,
+                                                    (const uint8_t * const*)frame->data,
+                                                    frame->linesize, frame->format,
+                                                    frame->width, frame->height, 1);
+                            
+                            sampled_count++;
+                        }
+                    }
+                    frame_idx++;
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    g_total_frames = sampled_count; 
+    g_ndp_state = 2; // READY
+    rsp->cdw0 = (uint32_t)(g_total_frames * current_frame_size);
+
+    SPDK_NOTICELOG("[NDP] Sampling Done. Total Sampled: %d frames, Size: %u bytes\n", 
+                    g_total_frames, rsp->cdw0);
+
+release:
+    if (codec_ctx) avcodec_free_context(&codec_ctx);
+    if (fmt_ctx) avformat_close_input(&fmt_ctx);
+    if (avio_ctx) av_freep(&avio_ctx->buffer);
+    av_freep(&avio_ctx);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+
+cleanup:
+    rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+    rsp->status.sc = SPDK_NVME_SC_SUCCESS;
+    spdk_bdev_free_io(bdev_io);
     spdk_free(ctx->read_buf);
     spdk_free(ctx);
-
     spdk_nvmf_request_complete(req);
 }
 
@@ -1206,22 +1362,22 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 
 	void *buf = req->iov[0].iov_base;
 
-	// 각 extent에 대해서 LBA와 블록 수 파싱 및 I/O
+	// parse extents from the buffer (LBA and block count pairs)
 	for (uint32_t i = 0; i < extents_count; i++) {
 		memcpy(&lba[i],    buf + 2 * i * 8,  8);
 		memcpy(&blocks[i], buf + 2 * i * 8 + 8,  8);
 
 		SPDK_NOTICELOG("[CUST] extent[0]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n", 8 * lba[i], 8 * blocks[i]);
 
-		/* 버퍼 할당 */
+		// alloc buffer for this read
 		void *read_buf = spdk_dma_zmalloc(8 * block_size * blocks[i], 0, NULL);
 
 		if (!read_buf) {
 			SPDK_ERRLOG("Memory allocation failed\n");
-			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE; 
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		}
 
-		/* Context 할당 및 설정 */
+		// alloc context for this read
 		struct ndp_request_ctx *ctx = spdk_zmalloc(sizeof(struct ndp_request_ctx),0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 		if (!ctx) {
 			SPDK_ERRLOG("Context allocation failed\n");
@@ -1234,10 +1390,10 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 		ctx->req = req;
 		ctx->read_buf = read_buf;
 
-		/* 비동기 읽기 요청 - ctx를 인자로 넘김 */
+		// async I/O submission
 		int rc = spdk_bdev_read_blocks(desc, ch,
 					ctx->read_buf, ctx->read_start_lba, ctx->read_num_blocks,
-					ndp_read_complete, ctx);
+					preprocess_video_yolo, ctx);
 
 		if (rc != 0) {
 			SPDK_ERRLOG("Read submission failed rc=%d\n", rc);
@@ -1247,77 +1403,107 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 		}
 	}
 
-    /* 비동기 처리 중이므로 ASYNCHRONOUS 리턴 */
+    // async I/O submitted, will complete in callback
     return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 }
 
-// int
-// nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
-//                                       struct spdk_bdev_desc *desc,
-//                                       struct spdk_io_channel *ch,
-//                                       struct spdk_nvmf_request *req)
-// {
-//     struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
-//     struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+int
+nvmf_bdev_ctrlr_custom_get_result_cmd(struct spdk_bdev *bdev,
+                                     struct spdk_bdev_desc *desc,
+                                     struct spdk_io_channel *ch,
+                                     struct spdk_nvmf_request *req)
+{
+    struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+    struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 
-// 	/* check for coming command */
-//     SPDK_NOTICELOG("[CUST] Entered custom preprocess (OPC=0x%02x)\n", cmd->opc);
+    // 1. state check, buffer check
+    if (g_ndp_state != 2 || full_video_buffer == NULL) {
+        SPDK_ERRLOG("[CUST] Data not ready. State: %d\n", g_ndp_state);
+        response->status.sct = SPDK_NVME_SCT_GENERIC;
+        response->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+        return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+    }
 
-//     /* 1) cdw10 host send = number of extents  */
-//     uint32_t extent_cnt = cmd->cdw10;
-//     SPDK_NOTICELOG("[CUST] extent_cnt = %u\n", extent_cnt);
+    if (req->iovcnt == 0 || req->length == 0) {
+        SPDK_ERRLOG("[CUST] Invalid request: length=%u, iovcnt=%d\n", req->length, req->iovcnt);
+        response->status.sct = SPDK_NVME_SCT_GENERIC;
+        response->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+        return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+    }
 
-//     /* 2) check data */
-//     if (!req->iov || req->iovcnt <= 0) {
-//         SPDK_ERRLOG("[CUST][ERR] No IOV payload from host (iovcnt=%d)\n", req->iovcnt);
-//         rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-//         rsp->status.sc  = SPDK_NVME_SC_DATA_TRANSFER_ERROR;
-//         return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-//     }
+	// 2. calculate video size and validate offset/length 
+	uint32_t frame_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, g_video_width, g_video_height, 1);
+    uint32_t total_video_size = (uint32_t)g_total_frames * frame_size;      // total size of the sampled video data in bytes
 
-//     /* 3) parsing recieved extent table for lba and number of blocks from extent data */
-//     size_t meta_bytes = (size_t)extent_cnt * 2 * sizeof(uint64_t);
-//     uint8_t *buf = (uint8_t *)req->iov[0].iov_base;
+    uint32_t total_to_transfer = req->length; // requested transfer size in bytes
+	uint32_t offset = cmd->cdw10; // requested start position
+	if (offset >= total_video_size) {
+		SPDK_ERRLOG("[CUST] Invalid offset: %u (Total: %u)\n", offset, total_video_size);
+        response->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+        return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+    }
 
-//     for (uint32_t i = 0; i < extent_cnt; i++) {
-//         uint64_t lba, blocks;
-//         memcpy(&lba,    buf + i * 16 + 0,  8);
-//         memcpy(&blocks, buf + i * 16 + 8,  8);
-//         SPDK_NOTICELOG("[CUST] extent[%u]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n",
-//                        i, lba, blocks);
+	uint32_t video_data_remaining = total_video_size - offset;
+    uint32_t bytes_left_to_send = total_to_transfer; // requested data remaining to be sent to the host
+    uint8_t *src_ptr = (uint8_t *)full_video_buffer + offset;
 
-// 		/* get(read) target file */
-// 		void* read_buf = spdk_malloc(4096 * blocks, 0x1000, NULL,
-// 							SPDK_ENV_SOCKET_ID_ANY,
-// 							SPDK_MALLOC_DMA);
+    SPDK_NOTICELOG("[CUST] Transferring Chunk: Offset=%u, Length=%u (Remaining Video: %u)\n", 
+                   offset, total_to_transfer, video_data_remaining);
 
-// 		int rc = spdk_bdev_read_blocks(desc, ch,
-// 					read_buf, lba, blocks,
-// 					nvmf_bdev_ctrlr_complete_cmd, req);
+    // 3. Fill the request's IOVs with video data and padding
+    for (int i = 0; i < req->iovcnt && bytes_left_to_send > 0; i++) {
+        uint8_t *dst_ptr = (uint8_t *)req->iov[i].iov_base;
+        uint32_t iov_len = req->iov[i].iov_len;
 
-// 		SPDK_NOTICELOG("print read_buf : \n%s\n", (char*)read_buf);
-//     }
+		// SPDK_NOTICELOG("[CUST] iovlen=%ld\n", req->iov[i].iov_len); => 131072
 
-// 	/* get(read) target file */
-// 	// void* read_buf = spdk_malloc(4096 * blocks, 0x1000, NULL,
-// 	// 					SPDK_ENV_SOCKET_ID_ANY,
-//     //                     SPDK_MALLOC_DMA);
+        // calculate how many bytes to fill in this IOV (either the full IOV or the remaining requested data)
+        uint32_t current_fill_len = spdk_min(iov_len, bytes_left_to_send);
+        uint32_t offset_in_iov = 0;
 
-// 	// int rc = spdk_bdev_read_blocks(desc, ch,
-// 	// 			read_buf, lba, blocks,
-// 	// 			nvmf_bdev_ctrlr_complete_cmd, req);
+        // copy video data to IOV
+        if (video_data_remaining > 0) {
+            uint32_t to_copy = spdk_min(current_fill_len, video_data_remaining);
+            memcpy(dst_ptr, src_ptr, to_copy);
+            
+            src_ptr += to_copy;
+			offset_in_iov += to_copy;
+            video_data_remaining -= to_copy;
+        }
 
-// 	// SPDK_NOTICELOG("print read_buf : \n%s\n", (char*)read_buf);
+        // padding with zeros if this IOV is not fully filled with video data
+        if (offset_in_iov < current_fill_len) {
+            uint32_t to_pad = current_fill_len - offset_in_iov;
+            memset(dst_ptr + offset_in_iov, 0, to_pad);
+        }
 
-//     /* final) set response of complete status */
-//     rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-//     rsp->status.sc  = SPDK_NVME_SC_SUCCESS;
-//     SPDK_NOTICELOG("[CUST] Completed parsing, returning SUCCESS.\n");
+        bytes_left_to_send -= current_fill_len;
+    }
 
-//     return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-// }
+    response->cdw0 = g_video_width << 16 | g_video_height;
 
 
+	if(offset + total_to_transfer >= total_video_size){
+		SPDK_NOTICELOG("[CUST] Final chunk reached. Freeing buffer and resetting state.\n");
+		if (full_video_buffer != NULL) {
+			spdk_dma_free(full_video_buffer);
+			full_video_buffer = NULL;
+			
+		}
+		g_ndp_state = 0;
+		g_video_width = 0;
+		g_video_height = 0;
+		g_total_frames = 0;
+	} else {
+        // remain data exists for future requests
+        SPDK_NOTICELOG("[CUST] Chunk sent. Waiting for next offset: %u\n", offset + total_to_transfer);
+    }
+
+	response->status.sct = SPDK_NVME_SCT_GENERIC;
+    response->status.sc = SPDK_NVME_SC_SUCCESS;
+    
+    return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+}
 
 int
 nvmf_bdev_ctrlr_compare_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
