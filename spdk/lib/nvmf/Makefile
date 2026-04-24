@@ -11,13 +11,13 @@ SO_MINOR := 0
 
 C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
 	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c \
-	 stubs.c mdns_server.c
+	 stubs.c mdns_server.c nvmf_image.c
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 
 LIBNAME = nvmf
-LOCAL_SYS_LIBS =
+LOCAL_SYS_LIBS = -lm -lavformat -lavcodec -lavutil -lswscale
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure

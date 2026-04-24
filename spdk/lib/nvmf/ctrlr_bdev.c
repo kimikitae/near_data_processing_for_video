@@ -7,6 +7,7 @@
 #include "spdk/stdinc.h"
 
 #include "nvmf_internal.h"
+#include "nvmf_image.h"
 
 #include "spdk/bdev.h"
 #include "spdk/endian.h"
@@ -1151,9 +1152,11 @@ uint16_t g_video_width = 0;
 uint16_t g_video_height = 0;
 
 struct ndp_request_ctx {
-	uint64_t read_start_lba, read_num_blocks;
+	uint64_t read_num_blocks, read_start_lba;
     struct spdk_nvmf_request *req;
     void *read_buf;
+	uint32_t remaining_extents;
+	uint64_t total_video_size;
 };
 
 struct buffer_data {
@@ -1194,6 +1197,58 @@ static int64_t seek_packet(void *opaque, int64_t offset, int whence) {
     return (int64_t)(bd->ptr - bd->start);
 }
 
+image ndp_avframe_to_image(AVFrame *frame) {
+    int w = frame->width;
+    int h = frame->height;
+    int c = 3;
+    
+    // 1. Darknet image 구조체 생성 (내부적으로 float 데이터 버퍼 할당됨)
+    image im = make_image(w, h, c);
+
+    // Y, U, V 데이터의 시작 주소
+    unsigned char *data_y = frame->data[0];
+    unsigned char *data_u = frame->data[1];
+    unsigned char *data_v = frame->data[2];
+
+    // 각 평면의 한 줄(row)당 바이트 크기 (Padding 고려)
+    int stride_y = frame->linesize[0];
+    int stride_u = frame->linesize[1];
+    int stride_v = frame->linesize[2];
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            // YUV420P: U, V는 Y의 가로/세로 1/2 크기임
+            int y_idx = y * stride_y + x;
+            int uv_idx = (y / 2) * stride_u + (x / 2);
+
+            float Y = data_y[y_idx];
+            float U = data_u[uv_idx];
+            float V = data_v[uv_idx];
+
+            // 2. YUV to RGB 변환 공식 (표준 BT.601)
+            float r = Y + 1.402 * (V - 128);
+            float g = Y - 0.344136 * (U - 128) - 0.714136 * (V - 128);
+            float b = Y + 1.772 * (U - 128);
+
+            // 3. 정규화 (0~255 -> 0.0~1.0) 및 Clamping (0~1 범위 제한)
+            r = r / 255.0;
+            g = g / 255.0;
+            b = b / 255.0;
+
+            if (r < 0) r = 0; if (r > 1) r = 1;
+            if (g < 0) g = 0; if (g > 1) g = 1;
+            if (b < 0) b = 0; if (b > 1) b = 1;
+
+            // 4. Darknet Planar 포맷으로 저장
+            // im.data 구조: [Red 평면(w*h)] [Green 평면(w*h)] [Blue 평면(w*h)]
+            im.data[x + y * w + 0 * w * h] = r; // R
+            im.data[x + y * w + 1 * w * h] = g; // G
+            im.data[x + y * w + 2 * w * h] = b; // B
+        }
+    }
+
+    return im;
+}
 
 static void
 preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
@@ -1208,13 +1263,25 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
         goto cleanup;
     }
 
+	if (ctx->remaining_extents > 1) {
+		ctx->remaining_extents--;
+		spdk_bdev_free_io(bdev_io);
+		return; // wait for next read completion
+	}
+
     if (g_ndp_state != 0) {
-        SPDK_ERRLOG("NDP Busy\n");
+        SPDK_ERRLOG("NDP Busy (g_ndp_state: %d)\n", g_ndp_state);
         goto cleanup;
     }
+	g_ndp_state = 1;
 
-    g_ndp_state = 1;
+	int g_video_width = 416; 
+	int g_video_height = 416;
+	int net_c = 3;
+	int letter_box = 1; // 1: letterbox, 0: resize
 
+	int processed_frame_bytes = g_video_width * g_video_height * net_c * sizeof(float);
+	
     // init FFmpeg contexts
     AVFormatContext *fmt_ctx = NULL;
     AVCodecContext *codec_ctx = NULL;
@@ -1232,8 +1299,8 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
     struct buffer_data bd = {
         .ptr = (uint8_t *)ctx->read_buf,
         .start = (uint8_t *)ctx->read_buf,
-        .size = (size_t)(ctx->read_num_blocks * 512),
-        .total_size = (size_t)(ctx->read_num_blocks * 512)
+        .size = (size_t)(ctx->total_video_size),
+        .total_size = (size_t)(ctx->total_video_size)
     };
 
     avio_ctx_buffer = av_malloc(4096);
@@ -1269,9 +1336,9 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
     if (total_nb_frames <= 0) total_nb_frames = 1000; // temporary fallback if frame count is not available
 
     // (temporary) sample 1 out of every 10 frames, so we need buffer for at most total_nb_frames/10 frames
-    // int max_samples = (total_nb_frames / 10) + 1;
+    int max_samples = (total_nb_frames / 10) + 1;
 	// 모든 프레임을 샘플링하기 위해 max_samples를 total_nb_frames로 설정
-	int max_samples = total_nb_frames;
+	// int max_samples = total_nb_frames;
 
     // read frames and sample
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -1280,29 +1347,53 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
                 while (avcodec_receive_frame(codec_ctx, frame) == 0) {
                     
                     // sample every 10th frame
-                    //if (frame_idx % 10 == 0) {
+                    if (frame_idx % 10 == 0) {
 					// 모든 프레임을 샘플링하기 위해 조건문 제거
-					if (frame_idx % 1 == 0) {
-                        if (current_frame_size == 0) {
-                            current_frame_size = av_image_get_buffer_size(frame->format, frame->width, frame->height, 1);
-							g_video_width = frame->width;
-							g_video_height = frame->height;
-                        }
+					// if (frame_idx % 1 == 0) {
+
+                        // if (current_frame_size == 0) {
+                        //     current_frame_size = av_image_get_buffer_size(frame->format, frame->width, frame->height, 1);
+						// 	g_video_width = frame->width;
+						// 	g_video_height = frame->height;
+                        // }
 
                         if (full_video_buffer == NULL) {
                             // alloc buffer for sampled frames (assuming max_samples frames, each of size current_frame_size)
-                            full_video_buffer = spdk_dma_zmalloc(current_frame_size * max_samples, 4096, NULL);
+                            //full_video_buffer = spdk_dma_zmalloc(current_frame_size * max_samples, 4096, NULL);
+							full_video_buffer = spdk_dma_zmalloc(processed_frame_bytes * max_samples, 4096, NULL);
+							if (!full_video_buffer) {
+                            	SPDK_ERRLOG("Failed to allocate DMA buffer\n");
+                            	rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+								goto release;
+                        	}
                         }
 
                         if (full_video_buffer) {
+							image im_orig = ndp_avframe_to_image(frame);
+
+							image im_input = letter_box
+								? letterbox_image(im_orig, g_video_width, g_video_height)
+								: resize_image(im_orig, g_video_width, g_video_height);
+
+							uint8_t *dst_ptr = (uint8_t *)full_video_buffer + (sampled_count * processed_frame_bytes);
+                        	memcpy(dst_ptr, im_input.data, processed_frame_bytes);
+							
+							free_image(im_orig);
+							free_image(im_input);
+
+
+
                             // dst buffer for the current sampled frame is at offset (sampled_count * current_frame_size) in full_video_buffer
-                            uint8_t *dst_ptr = (uint8_t *)full_video_buffer + (sampled_count * current_frame_size);
+                            //uint8_t *dst_ptr = (uint8_t *)full_video_buffer + (sampled_count * current_frame_size);
                             
-                            av_image_copy_to_buffer(dst_ptr, current_frame_size,
+                            /* av_image_copy_to_buffer(dst_ptr, current_frame_size,
                                                     (const uint8_t * const*)frame->data,
                                                     frame->linesize, frame->format,
                                                     frame->width, frame->height, 1);
-                            
+							*/
+
+							// memcpy(dst_ptr, im_input.data, processed_frame_bytes);
+
                             sampled_count++;
                         }
                     }
@@ -1315,10 +1406,11 @@ preprocess_video_yolo(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
     g_total_frames = sampled_count; 
     g_ndp_state = 2; // READY
-    rsp->cdw0 = (uint32_t)(g_total_frames * current_frame_size);
+    rsp->cdw0 = (uint32_t)(g_total_frames * processed_frame_bytes);
+	rsp->status.sc = SPDK_NVME_SC_SUCCESS;
 
-    SPDK_NOTICELOG("[NDP] Sampling Done. Total Sampled: %d frames, Size: %u bytes\n", 
-                    g_total_frames, rsp->cdw0);
+    SPDK_NOTICELOG("[NDP] Sampling Done. Total frames: %ld, Total Sampled: %d frames, Sampled Size: %u bytes\n"
+                    , total_nb_frames, g_total_frames, rsp->cdw0);
 
 release:
     if (codec_ctx) avcodec_free_context(&codec_ctx);
@@ -1330,7 +1422,6 @@ release:
 
 cleanup:
     rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-    rsp->status.sc = SPDK_NVME_SC_SUCCESS;
     spdk_bdev_free_io(bdev_io);
     spdk_free(ctx->read_buf);
     spdk_free(ctx);
@@ -1362,45 +1453,61 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 
 	void *buf = req->iov[0].iov_base;
 
+	size_t total_len = 0;
+
 	// parse extents from the buffer (LBA and block count pairs)
 	for (uint32_t i = 0; i < extents_count; i++) {
 		memcpy(&lba[i],    buf + 2 * i * 8,  8);
 		memcpy(&blocks[i], buf + 2 * i * 8 + 8,  8);
 
-		SPDK_NOTICELOG("[CUST] extent[0]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n", 8 * lba[i], 8 * blocks[i]);
+		SPDK_NOTICELOG("[CUST] extent[%d]: LBA=%" PRIu64 ", blocks=%" PRIu64 "\n", i, 8 * lba[i], 8 * blocks[i]);
 
-		// alloc buffer for this read
-		void *read_buf = spdk_dma_zmalloc(8 * block_size * blocks[i], 0, NULL);
+		total_len += blocks[i] * block_size * 8;
+	}
 
-		if (!read_buf) {
-			SPDK_ERRLOG("Memory allocation failed\n");
-			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-		}
+	// alloc buffer for this read
+	void *read_buf = spdk_dma_zmalloc(total_len, 0, NULL);
 
-		// alloc context for this read
-		struct ndp_request_ctx *ctx = spdk_zmalloc(sizeof(struct ndp_request_ctx),0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (!ctx) {
-			SPDK_ERRLOG("Context allocation failed\n");
-			spdk_free(read_buf);
-			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
-		}
+	if (!read_buf) {
+		SPDK_ERRLOG("Memory allocation failed\n");
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
 
+	// alloc context for this read
+	struct ndp_request_ctx *ctx = spdk_zmalloc(sizeof(struct ndp_request_ctx),0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx) {
+		SPDK_ERRLOG("Context allocation failed\n");
+		spdk_free(read_buf);
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	ctx->req = req;
+    ctx->read_buf = read_buf; 
+    ctx->remaining_extents = extents_count;
+	ctx->total_video_size = 0;
+
+	uint64_t current_buffer_offset = 0;
+
+	for (uint32_t i = 0; i < extents_count; i++) {
 		ctx->read_start_lba = 8 * lba[i];
 		ctx->read_num_blocks = 8 * blocks[i];
-		ctx->req = req;
-		ctx->read_buf = read_buf;
+		uint64_t current_read_size = ctx->read_num_blocks * block_size;
 
 		// async I/O submission
 		int rc = spdk_bdev_read_blocks(desc, ch,
-					ctx->read_buf, ctx->read_start_lba, ctx->read_num_blocks,
+					ctx->read_buf + current_buffer_offset, ctx->read_start_lba, ctx->read_num_blocks,
 					preprocess_video_yolo, ctx);
 
 		if (rc != 0) {
 			SPDK_ERRLOG("Read submission failed rc=%d\n", rc);
+			ctx->remaining_extents--;
 			spdk_free(read_buf);
 			spdk_free(ctx);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		}
+
+		current_buffer_offset += current_read_size;
+		ctx->total_video_size += current_read_size;
 	}
 
     // async I/O submitted, will complete in callback
@@ -1432,8 +1539,13 @@ nvmf_bdev_ctrlr_custom_get_result_cmd(struct spdk_bdev *bdev,
     }
 
 	// 2. calculate video size and validate offset/length 
-	uint32_t frame_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, g_video_width, g_video_height, 1);
-    uint32_t total_video_size = (uint32_t)g_total_frames * frame_size;      // total size of the sampled video data in bytes
+	int g_video_width = 416; 
+	int g_video_height = 416;
+	int net_c = 3;
+    uint32_t processed_frame_size = g_video_width * g_video_height * net_c * sizeof(float);
+    uint32_t total_video_size = (uint32_t)g_total_frames * processed_frame_size;
+	//uint32_t frame_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, g_video_width, g_video_height, 1);
+    //uint32_t total_video_size = (uint32_t)g_total_frames * frame_size;      // total size of the sampled video data in bytes
 
     uint32_t total_to_transfer = req->length; // requested transfer size in bytes
 	uint32_t offset = cmd->cdw10; // requested start position
@@ -1488,7 +1600,6 @@ nvmf_bdev_ctrlr_custom_get_result_cmd(struct spdk_bdev *bdev,
 		if (full_video_buffer != NULL) {
 			spdk_dma_free(full_video_buffer);
 			full_video_buffer = NULL;
-			
 		}
 		g_ndp_state = 0;
 		g_video_width = 0;
