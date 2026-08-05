@@ -11,7 +11,7 @@ APP = nvmf_tgt
 
 C_SRCS := nvmf_main.c
 
-SYS_LIBS += -lavcodec -lavutil -lavformat
+SYS_LIBS += -lavcodec -lavutil -lavformat -ljpeg -lswscale -lpthread -lopencv_imgproc -lopencv_core -lstdc++
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST) event event_nvmf
 

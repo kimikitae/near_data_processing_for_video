@@ -17,7 +17,9 @@ C_SRCS-$(CONFIG_RDMA) += rdma.c
 C_SRCS-$(CONFIG_HAVE_EVP_MAC) += auth.c
 
 LIBNAME = nvmf
-LOCAL_SYS_LIBS = -lm -lavformat -lavcodec -lavutil -lswscale
+LOCAL_SYS_LIBS = -lm -lavformat -lavcodec -lavutil -lswscale -ljpeg -lpthread  -lopencv_imgproc -lopencv_core -lstdc++
+CXX_SRCS = ndp_cv.cpp
+CXXFLAGS += $(shell pkg-config --cflags opencv4)
 ifeq ($(CONFIG_RDMA),y)
 LOCAL_SYS_LIBS += -libverbs -lrdmacm
 #Attach only if FreeBSD and RDMA is specified with configure
