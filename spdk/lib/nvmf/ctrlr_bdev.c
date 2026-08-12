@@ -35,8 +35,6 @@
 #include <libswscale/swscale.h>
 #include <jpeglib.h>
 
-image ndp_avframe_to_image(AVFrame *frame);
-
 struct custom_grep_ctx {
     struct spdk_nvmf_request *req;
     char *buffer;
@@ -1149,7 +1147,12 @@ nvmf_bdev_ctrlr_custom_heaan_cipadd_cmd(struct spdk_bdev *bdev, struct spdk_bdev
     return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
-// 0: IDLE, 1: DECODING/WRITING, 2: READY/READABLE
+/*
+ * Pipeline state. Only the SPDK reactor thread writes this.
+ *   0 IDLE        no request in flight
+ *   1 DECODING    worker thread is preprocessing
+ *   2 READY       full_video_buffer holds a complete result
+ */
 volatile int g_ndp_state = 0;
 uint8_t *full_video_buffer = NULL;
 uint32_t g_total_frames = 0;
@@ -1158,11 +1161,16 @@ uint16_t g_video_width = 0;
 uint16_t g_video_height = 0;
 
 struct ndp_request_ctx {
-	uint64_t read_num_blocks, read_start_lba;
+    uint64_t read_num_blocks, read_start_lba;
     struct spdk_nvmf_request *req;
     void *read_buf;
-	uint32_t remaining_extents;
-	uint64_t total_video_size;
+    uint32_t remaining_extents;   /* completion counter for async bdev reads */
+    uint64_t total_video_size;
+ 
+    /* Parameters carried by the 0xC0 command */
+    uint32_t sample_rate;      /* cdw11[15:0], 0 falls back to 1 */
+    uint32_t scaler_sel;       /* cdw12[7:0],  0 falls back to BILINEAR */
+    uint32_t jpeg_quality;     /* cdw12[15:8], 0 falls back to 85 */
 };
 
 struct buffer_data {
@@ -1210,202 +1218,149 @@ static int64_t seek_packet(void *opaque, int64_t offset, int whence) {
 
 static struct SwsContext *g_sws_ctx  = NULL;
 static int g_sws_src_w = 0, g_sws_src_h = 0;
+static int g_sws_dst_w = 0, g_sws_dst_h = 0;
+static int g_sws_flags = -1;
 static enum AVPixelFormat g_sws_fmt  = AV_PIX_FMT_NONE;
-
+ 
+/* Map the host-supplied selector (cdw12[7:0]) to a libswscale flag.
+ * Exposed so that the contribution of the resampling kernel to detection
+ * accuracy can be isolated without rebuilding the target. */
+static int ndp_scaler_flags(uint32_t sel)
+{
+    switch (sel) {
+    case 1:  return SWS_POINT;          /* nearest neighbour, no low-pass */
+    case 2:  return SWS_FAST_BILINEAR;
+    case 3:  return SWS_BICUBIC;
+    case 4:  return SWS_AREA;
+    case 5:  return SWS_LANCZOS;
+    case 0:
+    default: return SWS_BILINEAR;
+    }
+}
+ 
+static const char *ndp_scaler_name(uint32_t sel)
+{
+    switch (sel) {
+    case 1:  return "POINT";
+    case 2:  return "FAST_BILINEAR";
+    case 3:  return "BICUBIC";
+    case 4:  return "AREA";
+    case 5:  return "LANCZOS";
+    default: return "BILINEAR";
+    }
+}
+ 
 /*
- * YUV frame → 416×416 letterbox HWC uint8
- * darknet image 생성 없음, CHW float 변환 없음
+ * Decoded YUV frame -> net_w x net_h letterboxed RGB24, HWC uint8.
+ *
+ * Normalisation and the HWC-to-CHW transpose are deliberately left to the
+ * host: a float32 CHW tensor is roughly two orders of magnitude larger than
+ * the JPEG that carries the same frame, so the split point is chosen where
+ * the transferred payload is smallest.
  */
 static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
-                                            int net_w, int net_h,
-                                            int *out_w, int *out_h)
+                                           int net_w, int net_h,
+                                           int sws_flags,
+                                           int *out_w, int *out_h,
+                                           int *out_scaled_w, int *out_scaled_h)
 {
     int sw = frame->width, sh = frame->height;
-
-    /* 종횡비 보존 축소 크기 */
-    float scale = fminf((float)net_w / sw, (float)net_h / sh);
-    int new_w   = (int)(sw * scale);
-    int new_h   = (int)(sh * scale);
-
-    /* SwsContext 재사용 */
-    if (!g_sws_ctx || g_sws_src_w != sw ||
-        g_sws_src_h != sh || g_sws_fmt != frame->format) {
+    if (sw <= 0 || sh <= 0) return NULL;
+ 
+    /* Integer arithmetic identical to darknet's letterbox_image(). Using a
+     * float scale factor here can round differently and shift the scaled
+     * region by one pixel, which would bias every box the host recovers
+     * through correct_yolo_boxes(). */
+    int new_w, new_h;
+    if (((float)net_w / sw) < ((float)net_h / sh)) {
+        new_w = net_w;
+        new_h = (sh * net_w) / sw;
+    } else {
+        new_h = net_h;
+        new_w = (sw * net_h) / sh;
+    }
+    if (new_w < 1) new_w = 1;
+    if (new_h < 1) new_h = 1;
+ 
+    /* Cache the scaler context. The destination size and the flags are part
+     * of the key, otherwise a changed scaler selector would silently reuse
+     * the previous kernel. */
+    if (!g_sws_ctx || g_sws_src_w != sw || g_sws_src_h != sh ||
+        g_sws_dst_w != new_w || g_sws_dst_h != new_h ||
+        g_sws_flags != sws_flags || g_sws_fmt != frame->format) {
         if (g_sws_ctx) sws_freeContext(g_sws_ctx);
         g_sws_ctx = sws_getContext(sw, sh, frame->format,
-                           new_w, new_h, AV_PIX_FMT_RGB24,
-                           SWS_BILINEAR, NULL, NULL, NULL);
-        g_sws_src_w = sw; g_sws_src_h = sh; g_sws_fmt = frame->format;
+                                   new_w, new_h, AV_PIX_FMT_RGB24,
+                                   sws_flags, NULL, NULL, NULL);
+        g_sws_src_w = sw;    g_sws_src_h = sh;
+        g_sws_dst_w = new_w; g_sws_dst_h = new_h;
+        g_sws_flags = sws_flags;
+        g_sws_fmt   = frame->format;
     }
     if (!g_sws_ctx) return NULL;
-
-    /* 축소 RGB 버퍼 */
-    uint8_t *scaled = (uint8_t *)malloc(new_w * new_h * 3);
+ 
+    uint8_t *scaled = (uint8_t *)malloc((size_t)new_w * new_h * 3);
     if (!scaled) return NULL;
     uint8_t *dst[4]    = { scaled, NULL, NULL, NULL };
     int      dst_ls[4] = { 3 * new_w, 0, 0, 0 };
     sws_scale(g_sws_ctx,
               (const uint8_t * const *)frame->data, frame->linesize,
               0, sh, dst, dst_ls);
-
-    /* 416×416 letterbox 버퍼, 회색(128) 패딩 */
-    uint8_t *lb = (uint8_t *)malloc(net_w * net_h * 3);
+ 
+    /* Grey padding, matching darknet's 0.5f fill value */
+    uint8_t *lb = (uint8_t *)malloc((size_t)net_w * net_h * 3);
     if (!lb) { free(scaled); return NULL; }
-    memset(lb, 128, net_w * net_h * 3);  /* 0.5f → 128 */
-
-    /* 중앙 배치 */
+    memset(lb, 128, (size_t)net_w * net_h * 3);
+ 
     int dx = (net_w - new_w) / 2;
     int dy = (net_h - new_h) / 2;
     for (int j = 0; j < new_h; ++j)
-        memcpy(lb + ((dy + j) * net_w + dx) * 3,
-               scaled + j * new_w * 3,
-               new_w * 3);
-
+        memcpy(lb + ((size_t)(dy + j) * net_w + dx) * 3,
+               scaled + (size_t)j * new_w * 3,
+               (size_t)new_w * 3);
+ 
     free(scaled);
     *out_w = net_w;
     *out_h = net_h;
-    return lb;  /* HWC uint8, 호출자가 free() */
+    if (out_scaled_w) *out_scaled_w = new_w;
+    if (out_scaled_h) *out_scaled_h = new_h;
+    return lb;   /* caller frees */
 }
 
-/*
- * HWC uint8 → JPEG (CHW 변환 없음)
- */
+/* HWC uint8 RGB -> in-memory JPEG. Quality is host-controlled via
+ * cdw12[15:8]; 0 selects the 85 default. */
 static uint8_t *encode_jpeg_from_rgb(uint8_t *rgb, int w, int h,
-                                      size_t *out_size)
+                                     int quality, size_t *out_size)
 {
     struct jpeg_compress_struct cinfo;
     struct jpeg_error_mgr       jerr;
     uint8_t      *outbuf  = NULL;
     unsigned long outsize = 0;
-
+ 
+    if (quality < 1 || quality > 100) quality = 85;
+ 
     cinfo.err = jpeg_std_error(&jerr);
     jpeg_create_compress(&cinfo);
     jpeg_mem_dest(&cinfo, &outbuf, &outsize);
-
+ 
     cinfo.image_width      = w;
     cinfo.image_height     = h;
     cinfo.input_components = 3;
     cinfo.in_color_space   = JCS_RGB;
     jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, 85, TRUE);
+    jpeg_set_quality(&cinfo, quality, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
-
+ 
     while (cinfo.next_scanline < cinfo.image_height) {
         JSAMPROW row = (JSAMPROW)(&rgb[cinfo.next_scanline * w * 3]);
         jpeg_write_scanlines(&cinfo, &row, 1);
     }
     jpeg_finish_compress(&cinfo);
     jpeg_destroy_compress(&cinfo);
-
+ 
     *out_size = (size_t)outsize;
-    return outbuf;
+    return outbuf;   /* allocated by libjpeg, caller frees */
 }
-
-// image ndp_avframe_to_image(AVFrame *frame)
-// {
-//     int width = frame->width;
-//     int height = frame->height;
-
-//     // 결과 image (RGB)
-//     image im = make_image(width, height, 3);
-
-//     // FFmpeg swscale context 생성
-//     struct SwsContext *sws = sws_getContext(
-//         width, height, frame->format,
-//         width, height, AV_PIX_FMT_RGB24,
-//         SWS_BILINEAR, NULL, NULL, NULL);
-
-//     if (!sws) {
-//         fprintf(stderr, "[ERROR] sws_getContext failed\n");
-//         return make_image(0,0,0);
-//     }
-
-//     // RGB 버퍼 할당
-//     uint8_t *rgb_data = (uint8_t *)malloc(width * height * 3);
-//     uint8_t *dest[4] = { rgb_data, NULL, NULL, NULL };
-//     int dest_linesize[4] = { 3 * width, 0, 0, 0 };
-
-//     // 변환 실행 (핵심)
-//     sws_scale(
-//         sws,
-//         (const uint8_t * const*)frame->data,
-//         frame->linesize,
-//         0,
-//         height,
-//         dest,
-//         dest_linesize
-//     );
-
-//     // unsigned char → float (Darknet format)
-//     for (int k = 0; k < 3; ++k) {
-//         for (int j = 0; j < height; ++j) {
-//             for (int i = 0; i < width; ++i) {
-//                 int dst_idx = i + width*j + width*height*k;
-//                 int src_idx = k + 3*i + 3*width*j;
-//                 im.data[dst_idx] = rgb_data[src_idx] / 255.0f;
-//             }
-//         }
-//     }
-
-//     // cleanup
-//     free(rgb_data);
-//     sws_freeContext(sws);
-
-//     return im;
-// }
-
-// /* ══════════════════════════════════════════════════════════════
-//  * darknet float image (CHW, [0,255]) → JPEG 인메모리 압축
-//  * 반환값: libjpeg 할당 버퍼 (호출자가 free() 해야 함)
-//  * *out_size: 압축된 JPEG 바이트 수
-//  * ══════════════════════════════════════════════════════════════ */
-// static uint8_t *encode_jpeg(image im, size_t *out_size)
-// {
-//     /* float CHW [0,255] → uint8 HWC 변환  */
-//     uint8_t *rgb = (uint8_t *)malloc((size_t)im.w * im.h * 3);
-//     if (!rgb) return NULL;
- 
-//     for (int i = 0; i < im.h; i++) {
-//         for (int j = 0; j < im.w; j++) {
-//             int idx = i * im.w + j;
-//             float rv = im.data[0 * im.w * im.h + idx];
-//             float gv = im.data[1 * im.w * im.h + idx];
-//             float bv = im.data[2 * im.w * im.h + idx];
-            
-//             /*  캐스팅만 수행 */
-//             rgb[(i * im.w + j) * 3 + 0] = (uint8_t)(rv * 255.0f);
-//             rgb[(i * im.w + j) * 3 + 1] = (uint8_t)(gv * 255.0f);
-//             rgb[(i * im.w + j) * 3 + 2] = (uint8_t)(bv * 255.0f);
-//         }
-//     }
- 
-//     struct jpeg_compress_struct cinfo;
-//     struct jpeg_error_mgr jerr;
-//     uint8_t *outbuf = NULL;
-//     unsigned long outsize = 0;
- 
-//     cinfo.err = jpeg_std_error(&jerr);
-//     jpeg_create_compress(&cinfo);
-//     jpeg_mem_dest(&cinfo, &outbuf, &outsize);
- 
-//     cinfo.image_width      = im.w;
-//     cinfo.image_height     = im.h;
-//     cinfo.input_components = 3;
-//     cinfo.in_color_space   = JCS_RGB;
-//     jpeg_set_defaults(&cinfo);
-//     jpeg_set_quality(&cinfo, 85, TRUE);
-//     jpeg_start_compress(&cinfo, TRUE);
- 
-//     while (cinfo.next_scanline < cinfo.image_height) {
-//         JSAMPROW row = (JSAMPROW)(&rgb[cinfo.next_scanline * im.w * 3]);
-//         jpeg_write_scanlines(&cinfo, &row, 1);
-//     }
-//     jpeg_finish_compress(&cinfo);
-//     jpeg_destroy_compress(&cinfo);
-//     free(rgb);
- 
-//     *out_size = (size_t)outsize;
-//     return outbuf;  /* libjpeg 할당, 호출자가 free() */
-// }
 
 struct ndp_offload_ctx {
     /* SPDK side */
@@ -1474,7 +1429,6 @@ ndp_preprocess_worker(void *arg)
  
     const int net_w      = 416;
     const int net_h      = 416;
-    const int letter_box = 1;
  
     AVFormatContext *fmt_ctx = NULL;
     AVCodecContext  *codec_ctx = NULL;
@@ -1545,8 +1499,16 @@ ndp_preprocess_worker(void *arg)
     int64_t total_nb_frames = fmt_ctx->streams[video_stream_idx]->nb_frames;
     if (total_nb_frames <= 0) total_nb_frames = 1000;
 
-    int sample_rate = 4; /* sample every N frames */
-    int max_samples = (total_nb_frames / sample_rate) + 1;
+    int sample_rate = (int)ctx->sample_rate;
+    if (sample_rate < 1) sample_rate = 1;
+ 
+    const int sws_flags    = ndp_scaler_flags(ctx->scaler_sel);
+    int       jpeg_quality = (int)ctx->jpeg_quality;
+    if (jpeg_quality < 1 || jpeg_quality > 100) jpeg_quality = 85;
+ 
+    /* Must match the host's expectation of ((total - 1) / rate) + 1, or the
+     * host's frame-alignment guard will reject the result. */
+    int max_samples = (int)((total_nb_frames - 1) / sample_rate) + 1;
     jpeg_frames = (uint8_t **)calloc(max_samples, sizeof(uint8_t *));
     jpeg_sizes  = (size_t   *)calloc(max_samples, sizeof(size_t));
     if (!jpeg_frames || !jpeg_sizes) {
@@ -1555,60 +1517,106 @@ ndp_preprocess_worker(void *arg)
         goto release;
     }
  
+    SPDK_NOTICELOG("[NDP-verify] container_nb_frames=%ld  src=%dx%d  "
+                   "sample_rate=1/%d  max_samples=%d  scaler=%s  jpeg_q=%d\n",
+                   total_nb_frames, codec_ctx->width, codec_ctx->height,
+                   sample_rate, max_samples,
+                   ndp_scaler_name(ctx->scaler_sel), jpeg_quality);
     SPDK_NOTICELOG("[NDP-worker] Start decoding: total_frames=%ld, max_samples=%d\n",
                    total_nb_frames, max_samples);
 
     clock_gettime(CLOCK_MONOTONIC, &preprocess_start);
-    while (av_read_frame(fmt_ctx, pkt) >= 0) {
-        if (pkt->stream_index == video_stream_idx) {
-
-            if (avcodec_send_packet(codec_ctx, pkt) == 0) {
-                while (avcodec_receive_frame(codec_ctx, frame) == 0) {
-
-                    if (frame_idx % 3000 == 0) {
-                        SPDK_NOTICELOG("[NDP-worker] Progress: frame=%d/%ld, sampled=%d\n",
-                                    frame_idx, total_nb_frames, sampled_count);
-                        SPDK_NOTICELOG("[NDP-debug] frame->format=%d (%s)\n",
-                        frame->format,
-                        av_get_pix_fmt_name(frame->format));
-                    }
-
-                    if (frame_idx % sample_rate == 0 && sampled_count < max_samples) {
-
-                        int lb_w = 0, lb_h = 0;
-                        clock_gettime(CLOCK_MONOTONIC, &letterbox_start);
-                        uint8_t *lb = ndp_frame_to_letterbox_rgb(frame, net_w, net_h,
-                                                                &lb_w, &lb_h);
-                        clock_gettime(CLOCK_MONOTONIC, &letterbox_end);
-                        t_letterbox_total += (letterbox_end.tv_sec  - letterbox_start.tv_sec) +
-                                             (letterbox_end.tv_nsec - letterbox_start.tv_nsec) / 1e9;
-                        if (!lb) { frame_idx++; continue; }
-
-                        size_t jsize = 0;
-                        clock_gettime(CLOCK_MONOTONIC, &encode_start);
-                        uint8_t *jbuf = encode_jpeg_from_rgb(lb, lb_w, lb_h, &jsize);
-                        clock_gettime(CLOCK_MONOTONIC, &encode_end);
-                        t_encode_total += (encode_end.tv_sec  - encode_start.tv_sec) +
-                                          (encode_end.tv_nsec - encode_start.tv_nsec) / 1e9;
-                        free(lb);
-
-                        if (jbuf && jsize > 0) {
-                            jpeg_frames[sampled_count] = jbuf;
-                            jpeg_sizes[sampled_count]  = jsize;
-                            sampled_count++;
-                        } else if (jbuf) {
-                            free(jbuf);
-                        }
-                    }
-                    frame_idx++;
+ 
+    int eof_reached = 0;
+    while (!eof_reached) {
+        int got_pkt = (av_read_frame(fmt_ctx, pkt) >= 0);
+        if (!got_pkt) eof_reached = 1;
+ 
+        if (got_pkt && pkt->stream_index != video_stream_idx) {
+            av_packet_unref(pkt);
+            continue;
+        }
+ 
+        /* A NULL packet drains the decoder. Without it, frame-threaded
+         * decoders retain the last few frames and the sample count comes out
+         * short, which breaks the host's frame-index arithmetic. */
+        int send_rc = avcodec_send_packet(codec_ctx, got_pkt ? pkt : NULL);
+        if (got_pkt) av_packet_unref(pkt);
+        if (send_rc < 0 && send_rc != AVERROR(EAGAIN) && send_rc != AVERROR_EOF) {
+            SPDK_ERRLOG("[NDP-worker] send_packet failed rc=%d\n", send_rc);
+            break;
+        }
+ 
+        for (;;) {
+            int recv_rc = avcodec_receive_frame(codec_ctx, frame);
+            if (recv_rc == AVERROR(EAGAIN) || recv_rc == AVERROR_EOF) break;
+            if (recv_rc < 0) {
+                SPDK_ERRLOG("[NDP-worker] receive_frame failed rc=%d\n", recv_rc);
+                eof_reached = 1;
+                break;
+            }
+ 
+            if (frame_idx % 3000 == 0) {
+                SPDK_NOTICELOG("[NDP-worker] Progress: frame=%d/%ld, sampled=%d\n",
+                               frame_idx, total_nb_frames, sampled_count);
+                SPDK_NOTICELOG("[NDP-debug] frame->format=%d (%s)\n",
+                               frame->format, av_get_pix_fmt_name(frame->format));
+            }
+ 
+            /* Every frame is decoded regardless of the sampling rate, because
+             * inter-frame prediction makes decoding sequentially dependent.
+             * Sampling therefore reduces conversion and transfer cost, not
+             * decode cost. */
+            if (frame_idx % sample_rate == 0 && sampled_count < max_samples) {
+ 
+                int lb_w = 0, lb_h = 0, sc_w = 0, sc_h = 0;
+                clock_gettime(CLOCK_MONOTONIC, &letterbox_start);
+                uint8_t *lb = ndp_frame_to_letterbox_rgb(frame, net_w, net_h,
+                                                         sws_flags,
+                                                         &lb_w, &lb_h,
+                                                         &sc_w, &sc_h);
+                clock_gettime(CLOCK_MONOTONIC, &letterbox_end);
+                t_letterbox_total += (letterbox_end.tv_sec  - letterbox_start.tv_sec) +
+                                     (letterbox_end.tv_nsec - letterbox_start.tv_nsec) / 1e9;
+                if (!lb) { frame_idx++; continue; }
+ 
+                /* Logged once so the host can confirm both sides derive the
+                 * same letterbox geometry. */
+                if (sampled_count == 0) {
+                    SPDK_NOTICELOG("[NDP-verify2] src=%dx%d  scaled=%dx%d  "
+                                   "dx=%d dy=%d  canvas=%dx%d\n",
+                                   frame->width, frame->height, sc_w, sc_h,
+                                   (net_w - sc_w) / 2, (net_h - sc_h) / 2,
+                                   lb_w, lb_h);
+                }
+ 
+                size_t jsize = 0;
+                clock_gettime(CLOCK_MONOTONIC, &encode_start);
+                uint8_t *jbuf = encode_jpeg_from_rgb(lb, lb_w, lb_h,
+                                                     jpeg_quality, &jsize);
+                clock_gettime(CLOCK_MONOTONIC, &encode_end);
+                t_encode_total += (encode_end.tv_sec  - encode_start.tv_sec) +
+                                  (encode_end.tv_nsec - encode_start.tv_nsec) / 1e9;
+                free(lb);
+ 
+                if (jbuf && jsize > 0) {
+                    jpeg_frames[sampled_count] = jbuf;
+                    jpeg_sizes[sampled_count]  = jsize;
+                    sampled_count++;
+                } else if (jbuf) {
+                    free(jbuf);
                 }
             }
+            frame_idx++;
         }
-        av_packet_unref(pkt);
     }
+ 
     clock_gettime(CLOCK_MONOTONIC, &preprocess_end);
     t_preprocess_total = (preprocess_end.tv_sec  - preprocess_start.tv_sec) +
                          (preprocess_end.tv_nsec - preprocess_start.tv_nsec) / 1e9;
+ 
+    SPDK_NOTICELOG("[NDP-verify] decoded_frames=%d  sampled_count=%d  "
+                   "max_samples=%d\n", frame_idx, sampled_count, max_samples);
 
     /* Assemble output buffer */
     size_t header_bytes     = (1 + sampled_count) * sizeof(uint32_t);
@@ -1832,10 +1840,26 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
-	ctx->req = req;
-    ctx->read_buf = read_buf; 
+	ctx->req               = req;
+    ctx->read_buf          = read_buf;
     ctx->remaining_extents = extents_count;
-	ctx->total_video_size = 0;
+    ctx->total_video_size  = 0;
+ 
+    /* Zero means "use the target default" in every field, which keeps older
+     * hosts that only set cdw10/cdw11 working unchanged. */
+    ctx->sample_rate = cmd->cdw11 & 0xFFFFu;
+    if (ctx->sample_rate == 0) ctx->sample_rate = 1;
+ 
+    ctx->scaler_sel   = (cmd->cdw12      ) & 0xFFu;
+    ctx->jpeg_quality = (cmd->cdw12 >>  8) & 0xFFu;
+ 
+    SPDK_NOTICELOG("[CUST] sample_rate=1/%u  scaler=%s(%u)  jpeg_q=%u  "
+                   "(cdw11=0x%08x cdw12=0x%08x)\n",
+                   ctx->sample_rate,
+                   ndp_scaler_name(ctx->scaler_sel), ctx->scaler_sel,
+                   ctx->jpeg_quality ? ctx->jpeg_quality : 85,
+                   cmd->cdw11, cmd->cdw12);
+
 
 	uint64_t current_buffer_offset = 0;
 
