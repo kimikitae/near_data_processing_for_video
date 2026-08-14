@@ -1168,9 +1168,8 @@ struct ndp_request_ctx {
     uint64_t total_video_size;
  
     /* Parameters carried by the 0xC0 command */
-    uint32_t sample_rate;      /* cdw11[15:0], 0 falls back to 1 */
-    uint32_t scaler_sel;       /* cdw12[7:0],  0 falls back to BILINEAR */
-    uint32_t jpeg_quality;     /* cdw12[15:8], 0 falls back to 85 */
+    uint32_t sample_rate;      /* cdw11[15:0], 0 falls back to 1  */
+    uint32_t jpeg_quality;     /* cdw12[7:0],  0 falls back to 85 */
 };
 
 struct buffer_data {
@@ -1219,36 +1218,7 @@ static int64_t seek_packet(void *opaque, int64_t offset, int whence) {
 static struct SwsContext *g_sws_ctx  = NULL;
 static int g_sws_src_w = 0, g_sws_src_h = 0;
 static int g_sws_dst_w = 0, g_sws_dst_h = 0;
-static int g_sws_flags = -1;
 static enum AVPixelFormat g_sws_fmt  = AV_PIX_FMT_NONE;
- 
-/* Map the host-supplied selector (cdw12[7:0]) to a libswscale flag.
- * Exposed so that the contribution of the resampling kernel to detection
- * accuracy can be isolated without rebuilding the target. */
-static int ndp_scaler_flags(uint32_t sel)
-{
-    switch (sel) {
-    case 1:  return SWS_POINT;          /* nearest neighbour, no low-pass */
-    case 2:  return SWS_FAST_BILINEAR;
-    case 3:  return SWS_BICUBIC;
-    case 4:  return SWS_AREA;
-    case 5:  return SWS_LANCZOS;
-    case 0:
-    default: return SWS_BILINEAR;
-    }
-}
- 
-static const char *ndp_scaler_name(uint32_t sel)
-{
-    switch (sel) {
-    case 1:  return "POINT";
-    case 2:  return "FAST_BILINEAR";
-    case 3:  return "BICUBIC";
-    case 4:  return "AREA";
-    case 5:  return "LANCZOS";
-    default: return "BILINEAR";
-    }
-}
  
 /*
  * Decoded YUV frame -> net_w x net_h letterboxed RGB24, HWC uint8.
@@ -1260,7 +1230,6 @@ static const char *ndp_scaler_name(uint32_t sel)
  */
 static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
                                            int net_w, int net_h,
-                                           int sws_flags,
                                            int *out_w, int *out_h,
                                            int *out_scaled_w, int *out_scaled_h)
 {
@@ -1282,19 +1251,15 @@ static uint8_t *ndp_frame_to_letterbox_rgb(AVFrame *frame,
     if (new_w < 1) new_w = 1;
     if (new_h < 1) new_h = 1;
  
-    /* Cache the scaler context. The destination size and the flags are part
-     * of the key, otherwise a changed scaler selector would silently reuse
-     * the previous kernel. */
     if (!g_sws_ctx || g_sws_src_w != sw || g_sws_src_h != sh ||
         g_sws_dst_w != new_w || g_sws_dst_h != new_h ||
-        g_sws_flags != sws_flags || g_sws_fmt != frame->format) {
+        g_sws_fmt != frame->format) {
         if (g_sws_ctx) sws_freeContext(g_sws_ctx);
         g_sws_ctx = sws_getContext(sw, sh, frame->format,
                                    new_w, new_h, AV_PIX_FMT_RGB24,
-                                   sws_flags, NULL, NULL, NULL);
+                                   SWS_BILINEAR, NULL, NULL, NULL);
         g_sws_src_w = sw;    g_sws_src_h = sh;
         g_sws_dst_w = new_w; g_sws_dst_h = new_h;
-        g_sws_flags = sws_flags;
         g_sws_fmt   = frame->format;
     }
     if (!g_sws_ctx) return NULL;
@@ -1502,8 +1467,7 @@ ndp_preprocess_worker(void *arg)
     int sample_rate = (int)ctx->sample_rate;
     if (sample_rate < 1) sample_rate = 1;
  
-    const int sws_flags    = ndp_scaler_flags(ctx->scaler_sel);
-    int       jpeg_quality = (int)ctx->jpeg_quality;
+    int jpeg_quality = (int)ctx->jpeg_quality;
     if (jpeg_quality < 1 || jpeg_quality > 100) jpeg_quality = 85;
  
     /* Must match the host's expectation of ((total - 1) / rate) + 1, or the
@@ -1518,10 +1482,9 @@ ndp_preprocess_worker(void *arg)
     }
  
     SPDK_NOTICELOG("[NDP-verify] container_nb_frames=%ld  src=%dx%d  "
-                   "sample_rate=1/%d  max_samples=%d  scaler=%s  jpeg_q=%d\n",
+                   "sample_rate=1/%d  max_samples=%d  jpeg_q=%d\n",
                    total_nb_frames, codec_ctx->width, codec_ctx->height,
-                   sample_rate, max_samples,
-                   ndp_scaler_name(ctx->scaler_sel), jpeg_quality);
+                   sample_rate, max_samples, jpeg_quality);
     SPDK_NOTICELOG("[NDP-worker] Start decoding: total_frames=%ld, max_samples=%d\n",
                    total_nb_frames, max_samples);
 
@@ -1572,7 +1535,6 @@ ndp_preprocess_worker(void *arg)
                 int lb_w = 0, lb_h = 0, sc_w = 0, sc_h = 0;
                 clock_gettime(CLOCK_MONOTONIC, &letterbox_start);
                 uint8_t *lb = ndp_frame_to_letterbox_rgb(frame, net_w, net_h,
-                                                         sws_flags,
                                                          &lb_w, &lb_h,
                                                          &sc_w, &sc_h);
                 clock_gettime(CLOCK_MONOTONIC, &letterbox_end);
@@ -1845,18 +1807,15 @@ nvmf_bdev_ctrlr_custom_preprocess_cmd(struct spdk_bdev *bdev,
     ctx->remaining_extents = extents_count;
     ctx->total_video_size  = 0;
  
-    /* Zero means "use the target default" in every field, which keeps older
-     * hosts that only set cdw10/cdw11 working unchanged. */
+    /* Zero means "use the target default" in every field. */
     ctx->sample_rate = cmd->cdw11 & 0xFFFFu;
     if (ctx->sample_rate == 0) ctx->sample_rate = 1;
  
-    ctx->scaler_sel   = (cmd->cdw12      ) & 0xFFu;
-    ctx->jpeg_quality = (cmd->cdw12 >>  8) & 0xFFu;
+    ctx->jpeg_quality = cmd->cdw12 & 0xFFu;
  
-    SPDK_NOTICELOG("[CUST] sample_rate=1/%u  scaler=%s(%u)  jpeg_q=%u  "
+    SPDK_NOTICELOG("[CUST] sample_rate=1/%u  jpeg_q=%u  "
                    "(cdw11=0x%08x cdw12=0x%08x)\n",
                    ctx->sample_rate,
-                   ndp_scaler_name(ctx->scaler_sel), ctx->scaler_sel,
                    ctx->jpeg_quality ? ctx->jpeg_quality : 85,
                    cmd->cdw11, cmd->cdw12);
 
